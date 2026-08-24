@@ -201,9 +201,11 @@ class RegistrarModel(_RegistrarBase):
         )
         coarse_best_y0, coarse_best_score = max(coarse_scores, key=lambda item: item[1])
 
+        fine_start = max(self.y0_search_min, coarse_best_y0 - self.y0_fine_radius)
+        fine_stop = min(self.y0_search_max, coarse_best_y0 + self.y0_fine_radius)
         fine_candidates = self._scan_values(
-            coarse_best_y0 - self.y0_fine_radius,
-            coarse_best_y0 + self.y0_fine_radius,
+            fine_start,
+            fine_stop,
             self.y0_fine_step,
         )
         fine_scores = self._score_y0_candidates(
@@ -217,6 +219,7 @@ class RegistrarModel(_RegistrarBase):
                 f"(coarse best {coarse_best_y0:+.3f} mm; ZNCC={best_score:.6f})"
             )
 
+        boundary_hit = best_y0 in (self.y0_search_min, self.y0_search_max)
         self.save_kwargs["y0_estimation"].update(
             {
                 "performed": True,
@@ -225,10 +228,40 @@ class RegistrarModel(_RegistrarBase):
                 "coarse_best_y0_mm": coarse_best_y0,
                 "coarse_best_zncc": coarse_best_score,
                 "best_zncc": best_score,
+                "boundary_hit": boundary_hit,
                 "coarse_scores": coarse_scores,
                 "fine_scores": fine_scores,
             }
         )
+        if boundary_hit and self.verbose > 0:
+            print(
+                "Warning: best y0 is on the configured search boundary; "
+                "consider widening the search range."
+            )
+        return best_y0
+
+    def _refine_estimated_y0(self, gt, init_pose, sdd, delx, dely, x0, center_y0):
+        fine_start = max(self.y0_search_min, center_y0 - self.y0_fine_radius)
+        fine_stop = min(self.y0_search_max, center_y0 + self.y0_fine_radius)
+        candidates = self._scan_values(fine_start, fine_stop, self.y0_fine_step)
+        scores = self._score_y0_candidates(
+            gt, init_pose, sdd, delx, dely, x0, candidates
+        )
+        best_y0, best_score = max(scores, key=lambda item: item[1])
+
+        self.save_kwargs["y0_estimation"].update(
+            {
+                "pre_reprediction_y0_mm": float(center_y0),
+                "estimated_y0_mm": best_y0,
+                "best_zncc": best_score,
+                "post_reprediction_scores": scores,
+            }
+        )
+        if self.verbose > 0:
+            print(
+                f"Refined detector y0 after pose re-prediction = {best_y0:+.3f} mm "
+                f"(ZNCC={best_score:.6f})"
+            )
         return best_y0
 
     def _correct_initial_pose(self, pose):
@@ -260,6 +293,17 @@ class RegistrarModel(_RegistrarBase):
 
             # The model's resampling depends on y0, so re-run the pose regressor using
             # the estimated principal point before iterative registration begins.
+            init_pose, resampled_gt = predict_pose(
+                self.model, self.config, gt, sdd, delx, dely, x0, y0
+            )
+            init_pose = self._correct_initial_pose(init_pose)
+
+            # Pose and principal point are coupled. After correcting the model input
+            # with the first y0 estimate, perform one local y0 refinement and then
+            # make the final network prediction used to start iterative registration.
+            y0 = self._refine_estimated_y0(
+                gt, init_pose, sdd, delx, dely, x0, y0
+            )
             init_pose, resampled_gt = predict_pose(
                 self.model, self.config, gt, sdd, delx, dely, x0, y0
             )
