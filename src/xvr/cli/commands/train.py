@@ -464,14 +464,18 @@ def train(
     )
 
     # Set up logging
-    wandb.login(key=os.environ["WANDB_API_KEY"])
-    run = wandb.init(
-        project=project,
-        name=name if name is not None else project,
-        config=config,
-        id=id,
-        resume="must" if id is not None else None,
-    )
+    if os.environ.get("WANDB_MODE", "").lower() == "disabled":
+        print("WandB logging disabled.")
+        run = None
+    else:
+        wandb.login(key=os.environ["WANDB_API_KEY"])
+        run = wandb.init(
+            project=project,
+            name=name if name is not None else project,
+            config=config,
+            id=id,
+            resume="must" if id is not None else None,
+        )
 
     # Train the model
     trainer = Trainer(**config)

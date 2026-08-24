@@ -1,6 +1,5 @@
 import torch
 from diffdrr.metrics import DoubleGeodesicSE3, MultiscaleNormalizedCrossCorrelation2d
-from diffdrr.pose import RigidTransform
 
 
 class PoseRegressionLoss(torch.nn.Module):
@@ -43,31 +42,11 @@ class PoseRegressionLoss(torch.nn.Module):
 
     def multiview_consistency(self, true_pose, pred_pose):
         assert (B := len(true_pose)) == len(pred_pose)
-
-        idx, jdx = torch.triu_indices(
-            B,
-            B,
-            offset=1,
-            device=true_pose.matrix.device,
-        )
-
-        # RigidTransform advanced indexing returns a Tensor in the
-        # currently installed DiffDRR version. Re-wrap sliced matrices
-        # as RigidTransform objects before computing relative poses.
-        true_i = RigidTransform(true_pose.matrix[idx])
-        true_j = RigidTransform(true_pose.matrix[jdx])
-
-        pred_i = RigidTransform(pred_pose.matrix[idx])
-        pred_j = RigidTransform(pred_pose.matrix[jdx])
-
-        true_relative = true_j.compose(true_i.inverse())
-        pred_relative = pred_j.compose(pred_i.inverse())
-
+        idx, jdx = torch.triu_indices(B, B, offset=1)
         _, _, dgeo_relative = self.geodesic(
-            true_relative,
-            pred_relative,
+            true_pose[jdx] @ true_pose[idx].inverse(),
+            pred_pose[jdx] @ pred_pose[idx].inverse(),
         )
-
         return dgeo_relative
 
 

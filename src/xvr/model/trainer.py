@@ -201,7 +201,7 @@ class Trainer:
 
         img = img[keep]
         mask = mask[keep]
-        pose = pose[keep]
+        pose = RigidTransform(pose.matrix[keep])
 
         # Regress the poses of the DRRs (and optionally convert between reference frames)
         x = self.transforms(self.augmentations(img))
