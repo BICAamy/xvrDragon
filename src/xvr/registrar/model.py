@@ -1,13 +1,16 @@
+import json
 import math
+from pathlib import Path
 
 import torch
+from diffdrr.data import read
 from diffdrr.pose import RigidTransform
 from pydicom import dcmread
 
 from ..io import read_xray
+from ..metrics import project_fiducials_to_image_pixels
 from ..model.inference import _construct_antipode, _correct_pose, predict_pose
 from ..model.network import load_model
-from ..utils import XrayTransforms
 from .base import _RegistrarBase
 
 
@@ -58,12 +61,14 @@ class RegistrarModel(_RegistrarBase):
         x0_coarse_step=2.0,
         x0_fine_radius=3.0,
         x0_fine_step=0.25,
+        landmarks=None,
     ):
         self.ckptpath = ckptpath
         self.model, self.config, self.date = load_model(self.ckptpath, meta=True)
         self.warp = warp
         self.invert = invert
         self.antipodal = antipodal
+        self.landmarks = Path(landmarks) if landmarks is not None else None
 
         self.estimate_missing_x0 = estimate_missing_x0
         self.estimate_missing_y0 = estimate_missing_y0
@@ -77,7 +82,7 @@ class RegistrarModel(_RegistrarBase):
         self.y0_coarse_step = float(y0_coarse_step)
         self.y0_fine_radius = float(y0_fine_radius)
         self.y0_fine_step = float(y0_fine_step)
-        # Backward-compatible names: these now control the joint origin search.
+        # Kept for backward compatibility. Landmark mTRE scoring does not render DRRs.
         self.y0_search_scale = float(y0_search_scale)
         self.y0_max_rounds = int(y0_max_rounds)
         self.y0_convergence_tol = float(y0_convergence_tol)
@@ -116,12 +121,13 @@ class RegistrarModel(_RegistrarBase):
                 "date": self.date,
                 "warp": self.warp,
                 "invert": self.invert,
-                # Keep the historical key to avoid breaking result readers.
                 "y0_estimation": {
                     "enabled": self.estimate_missing_x0 or self.estimate_missing_y0,
-                    "mode": "alternating_coordinate_x0_y0",
+                    "mode": "alternating_coordinate_x0_y0_mtre",
+                    "objective": "2d_projected_landmark_mTRE_mm",
                     "performed": False,
                     "reason": None,
+                    "landmarks": str(self.landmarks) if self.landmarks is not None else None,
                     "x0_enabled": self.estimate_missing_x0,
                     "y0_enabled": self.estimate_missing_y0,
                     "x0_search_min_mm": self.x0_search_min,
@@ -134,7 +140,6 @@ class RegistrarModel(_RegistrarBase):
                     "coarse_step_mm": self.y0_coarse_step,
                     "fine_radius_mm": self.y0_fine_radius,
                     "fine_step_mm": self.y0_fine_step,
-                    "search_scale": self.y0_search_scale,
                     "max_rounds": self.y0_max_rounds,
                     "convergence_tol_mm": self.y0_convergence_tol,
                 },
@@ -165,8 +170,6 @@ class RegistrarModel(_RegistrarBase):
             self.y0_fine_radius,
             self.y0_fine_step,
         )
-        if self.y0_search_scale <= 0:
-            raise ValueError("y0_search_scale must be positive")
         if self.y0_max_rounds <= 0:
             raise ValueError("y0_max_rounds must be positive")
         if self.y0_convergence_tol <= 0:
@@ -182,13 +185,6 @@ class RegistrarModel(_RegistrarBase):
             return False
 
     @staticmethod
-    def _zncc(a, b, eps=1e-8):
-        a = a.flatten().double() - a.double().mean()
-        b = b.flatten().double() - b.double().mean()
-        denom = torch.sqrt((a * a).sum() * (b * b).sum())
-        return ((a * b).sum() / (denom + eps)).item()
-
-    @staticmethod
     def _scan_values(start, stop, step, include=None):
         n = int(round((stop - start) / step))
         values = [start + i * step for i in range(n + 1)]
@@ -199,40 +195,180 @@ class RegistrarModel(_RegistrarBase):
                 values.sort()
         return values
 
-    def _score_axis(self, gt, pose, sdd, delx, dely, x0, y0, axis, candidates):
-        """Score candidates in DICOM/XVR x0,y0 convention with pose fixed."""
-        *_, height, width = gt.shape
+    @staticmethod
+    def _sort_numeric_key(value):
+        try:
+            return (0, int(value))
+        except (TypeError, ValueError):
+            return (1, str(value))
 
-        def set_intrinsics(candidate):
-            candidate_x0 = float(candidate) if axis == "x0" else float(x0)
-            candidate_y0 = float(candidate) if axis == "y0" else float(y0)
-            self.drr.set_intrinsics_(
-                sdd=sdd,
-                height=height,
-                width=width,
-                delx=delx,
-                dely=dely,
-                # CRITICAL SIGN CONVENTION:
-                # read_xray/predict_pose use DICOM x0; DiffDRR uses -x0.
-                x0=-candidate_x0,
-                y0=candidate_y0,
+    def _resolve_landmarks_path(self, i2d):
+        path = self.landmarks if self.landmarks is not None else Path(i2d).parent / "landmarks.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                "mTRE-based principal-point search requires 3D/2D landmarks. "
+                f"No landmarks file found at {path}. The CLI expects landmarks.json next to the X-ray."
             )
-            self.drr.rescale_detector_(1.0 / self.y0_search_scale)
+        return path
 
-        set_intrinsics(candidates[0])
-        transform = XrayTransforms(self.drr.detector.height, self.drr.detector.width)
-        gt_search = transform(gt).cuda()
+    def _load_mtre_targets(self, i2d, height, width, pf_to_af):
+        orientation = str(self.config["orientation"]).upper()
+        if orientation != "AP":
+            raise NotImplementedError(
+                "mTRE-based automatic principal-point estimation is currently "
+                f"validated only for AP, got {orientation!r}."
+            )
+        if self.reverse_x_axis:
+            raise ValueError(
+                "mTRE-based AP origin search requires the canonical reverse_x_axis=False convention."
+            )
+        if self.crop != 0:
+            raise ValueError(
+                "mTRE-based AP origin search currently requires --crop 0 because "
+                "landmarks.json stores full-raster pixel coordinates."
+            )
+        if pf_to_af:
+            raise ValueError(
+                "The X-ray reader applied a hidden PF->AF horizontal flip. "
+                "Landmark-assisted origin search refuses to mix that convention."
+            )
+
+        path = self._resolve_landmarks_path(i2d)
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        try:
+            ct_lps = data["ct"]["landmarks_lps_mm"]
+            ap_pixels = data["views"]["ap"]["landmarks_px"]
+        except KeyError as exc:
+            raise KeyError(
+                f"{path} must contain ct.landmarks_lps_mm and views.ap.landmarks_px"
+            ) from exc
+
+        points_lps, points_px, names = [], [], []
+        for vertebra in sorted(set(ct_lps) & set(ap_pixels), key=self._sort_numeric_key):
+            ct_points = ct_lps[vertebra]
+            ap_points = ap_pixels[vertebra]
+            for point_id in sorted(set(ct_points) & set(ap_points), key=self._sort_numeric_key):
+                xyz = ct_points[point_id]
+                uv = ap_points[point_id]
+                if len(xyz) != 3 or len(uv) != 2:
+                    raise ValueError(
+                        f"Invalid landmark {vertebra}.{point_id}: 3D={xyz!r}, 2D={uv!r}"
+                    )
+                points_lps.append([float(v) for v in xyz])
+                points_px.append([float(v) for v in uv])
+                names.append(f"{vertebra}.{point_id}")
+
+        if not points_lps:
+            raise ValueError(f"No paired CT/AP landmarks found in {path}")
+
+        target_pixels = torch.tensor(points_px, dtype=torch.float32)[None].cuda()
+        if (
+            (target_pixels[..., 0] < 0).any()
+            or (target_pixels[..., 0] >= width).any()
+            or (target_pixels[..., 1] < 0).any()
+            or (target_pixels[..., 1] >= height).any()
+        ):
+            raise ValueError(
+                f"At least one AP landmark in {path} lies outside the {width}x{height} raster."
+            )
+
+        fiducials_ras = torch.tensor(points_lps, dtype=torch.float32)
+        fiducials_ras[:, 0] *= -1
+        fiducials_ras[:, 1] *= -1
+        fiducials_ras = fiducials_ras[None]
+
+        labels = self.labels
+        if isinstance(labels, str):
+            labels = [int(x) for x in labels.split(",") if x.strip()]
+
+        subject = read(
+            self.volume,
+            self.mask,
+            labels,
+            self.config["orientation"],
+            fiducials=fiducials_ras,
+            **self.read_kwargs,
+        )
+        fiducials = subject.fiducials.cuda()
+        if fiducials.shape[-2] != target_pixels.shape[-2]:
+            raise RuntimeError(
+                "DiffDRR fiducial count changed unexpectedly: "
+                f"3D={fiducials.shape[-2]}, 2D={target_pixels.shape[-2]}"
+            )
+
+        return {
+            "path": path,
+            "names": names,
+            "fiducials": fiducials,
+            "target_pixels": target_pixels,
+            "count": len(names),
+        }
+
+    def _score_axis(
+        self,
+        pose,
+        sdd,
+        delx,
+        dely,
+        height,
+        width,
+        x0,
+        y0,
+        axis,
+        candidates,
+        fiducials,
+        target_pixels,
+    ):
         scores = []
         with torch.no_grad():
             for candidate in candidates:
-                set_intrinsics(candidate)
-                score = self._zncc(gt_search, transform(self.drr(pose)))
-                scores.append((float(candidate), float(score)))
+                candidate_x0 = float(candidate) if axis == "x0" else float(x0)
+                candidate_y0 = float(candidate) if axis == "y0" else float(y0)
+                self.drr.set_intrinsics_(
+                    sdd=sdd,
+                    height=height,
+                    width=width,
+                    delx=delx,
+                    dely=dely,
+                    # CRITICAL SIGN CONVENTION:
+                    # DICOM/XVR candidate x0 -> DiffDRR detector x0 = -candidate_x0.
+                    x0=-candidate_x0,
+                    y0=candidate_y0,
+                )
+                projected = project_fiducials_to_image_pixels(
+                    self.drr,
+                    pose,
+                    fiducials,
+                    orientation="AP",
+                    reverse_x_axis=False,
+                )
+                delta = projected - target_pixels
+                error_mm = torch.sqrt(
+                    (delta[..., 0] * float(delx)) ** 2
+                    + (delta[..., 1] * float(dely)) ** 2
+                )
+                mtre_mm = error_mm.mean().item()
+                scores.append((float(candidate), float(mtre_mm)))
                 if self.verbose > 1:
-                    print(f"  {axis}={candidate:+7.2f} mm | ZNCC={score:.6f}")
+                    print(f"  {axis}={candidate:+7.2f} mm | mTRE={mtre_mm:.6f} mm")
         return scores
 
-    def _search_axis(self, gt, pose, sdd, delx, dely, x0, y0, axis):
+    def _search_axis(
+        self,
+        pose,
+        sdd,
+        delx,
+        dely,
+        height,
+        width,
+        x0,
+        y0,
+        axis,
+        fiducials,
+        target_pixels,
+    ):
         if axis == "x0":
             lo, hi = self.x0_search_min, self.x0_search_max
             coarse, radius, fine = (
@@ -254,21 +390,44 @@ class RegistrarModel(_RegistrarBase):
 
         coarse_values = self._scan_values(lo, hi, coarse, include=current)
         coarse_scores = self._score_axis(
-            gt, pose, sdd, delx, dely, x0, y0, axis, coarse_values
+            pose,
+            sdd,
+            delx,
+            dely,
+            height,
+            width,
+            x0,
+            y0,
+            axis,
+            coarse_values,
+            fiducials,
+            target_pixels,
         )
-        coarse_best, coarse_score = max(coarse_scores, key=lambda z: z[1])
+        coarse_best, coarse_mtre = min(coarse_scores, key=lambda z: z[1])
+
         fine_lo = max(lo, coarse_best - radius)
         fine_hi = min(hi, coarse_best + radius)
         fine_values = self._scan_values(fine_lo, fine_hi, fine, include=coarse_best)
         fine_scores = self._score_axis(
-            gt, pose, sdd, delx, dely, x0, y0, axis, fine_values
+            pose,
+            sdd,
+            delx,
+            dely,
+            height,
+            width,
+            x0,
+            y0,
+            axis,
+            fine_values,
+            fiducials,
+            target_pixels,
         )
-        best, score = max(fine_scores, key=lambda z: z[1])
+        best, mtre = min(fine_scores, key=lambda z: z[1])
         return {
             "best": float(best),
-            "score": float(score),
+            "mtre_mm": float(mtre),
             "coarse_best": float(coarse_best),
-            "coarse_score": float(coarse_score),
+            "coarse_mtre_mm": float(coarse_mtre),
             "coarse_scores": coarse_scores,
             "fine_scores": fine_scores,
             "boundary_hit": abs(best - fine_lo) <= fine / 2
@@ -289,6 +448,7 @@ class RegistrarModel(_RegistrarBase):
             self.linearize,
             self.reducefn,
         )
+        *_, height, width = gt.shape
         origin_present = self._detector_active_origin_present(i2d)
         metadata = self.save_kwargs["y0_estimation"]
         metadata.update(
@@ -313,8 +473,17 @@ class RegistrarModel(_RegistrarBase):
             result = (gt, sdd, delx, dely, x0, y0, pf_to_af, pose)
             return (*result, resampled_gt) if return_resampled else result
 
-        metadata["performed"] = True
-        metadata["reason"] = "DetectorActiveOrigin missing"
+        targets = self._load_mtre_targets(i2d, height, width, pf_to_af)
+        metadata.update(
+            {
+                "performed": True,
+                "reason": "DetectorActiveOrigin missing",
+                "landmarks": str(targets["path"]),
+                "n_landmarks": targets["count"],
+                "landmark_names": targets["names"],
+            }
+        )
+
         current_x0, current_y0 = float(x0), float(y0)
         rounds = []
         best = None
@@ -336,17 +505,26 @@ class RegistrarModel(_RegistrarBase):
 
             if self.verbose > 0:
                 print(
-                    f"\n[Auto origin] Round {round_idx + 1}/{self.y0_max_rounds}: "
-                    f"network input x0={input_x0:+.3f}, y0={input_y0:+.3f} mm"
+                    f"\n[Auto origin mTRE] Round {round_idx + 1}/{self.y0_max_rounds}: "
+                    f"network input x0={input_x0:+.3f}, y0={input_y0:+.3f} mm; "
+                    f"landmarks={targets['count']}"
                 )
 
-            # Alternating coordinate search with one fixed network pose:
-            # x0 first (y0 fixed), then y0 (new x0 fixed).
             x_result = None
             new_x0 = input_x0
             if self.estimate_missing_x0:
                 x_result = self._search_axis(
-                    gt, pose, sdd, delx, dely, input_x0, input_y0, "x0"
+                    pose,
+                    sdd,
+                    delx,
+                    dely,
+                    height,
+                    width,
+                    input_x0,
+                    input_y0,
+                    "x0",
+                    targets["fiducials"],
+                    targets["target_pixels"],
                 )
                 new_x0 = x_result["best"]
 
@@ -354,20 +532,30 @@ class RegistrarModel(_RegistrarBase):
             new_y0 = input_y0
             if self.estimate_missing_y0:
                 y_result = self._search_axis(
-                    gt, pose, sdd, delx, dely, new_x0, input_y0, "y0"
+                    pose,
+                    sdd,
+                    delx,
+                    dely,
+                    height,
+                    width,
+                    new_x0,
+                    input_y0,
+                    "y0",
+                    targets["fiducials"],
+                    targets["target_pixels"],
                 )
                 new_y0 = y_result["best"]
 
             final_result = y_result if y_result is not None else x_result
             if final_result is None:
                 raise RuntimeError("No principal-point coordinate enabled for search")
-            score = final_result["score"]
+            round_mtre = final_result["mtre_mm"]
             dx, dy = new_x0 - input_x0, new_y0 - input_y0
             delta = math.hypot(dx, dy)
 
-            if best is None or score > best["score"]:
+            if best is None or round_mtre < best["mtre_mm"]:
                 best = {
-                    "score": float(score),
+                    "mtre_mm": float(round_mtre),
                     "x0": float(new_x0),
                     "y0": float(new_y0),
                     "pose": RigidTransform(pose.matrix.detach().clone()),
@@ -381,9 +569,9 @@ class RegistrarModel(_RegistrarBase):
                 if result is None:
                     return {
                         "coarse_best": fallback,
-                        "coarse_score": None,
+                        "coarse_mtre_mm": None,
                         "best": fallback,
-                        "score": None,
+                        "mtre_mm": None,
                         "boundary_hit": False,
                         "coarse_scores": [],
                         "fine_scores": [],
@@ -397,39 +585,39 @@ class RegistrarModel(_RegistrarBase):
                     "input_x0_mm": float(input_x0),
                     "input_y0_mm": float(input_y0),
                     "coarse_best_x0_mm": xr["coarse_best"],
-                    "coarse_best_x0_zncc": xr["coarse_score"],
+                    "coarse_best_x0_mtre_mm": xr["coarse_mtre_mm"],
                     "best_x0_mm": float(new_x0),
-                    "x0_best_zncc": xr["score"],
+                    "x0_best_mtre_mm": xr["mtre_mm"],
                     "delta_x0_mm": abs(float(dx)),
                     "x0_boundary_hit": xr["boundary_hit"],
                     "x0_coarse_scores": xr["coarse_scores"],
                     "x0_fine_scores": xr["fine_scores"],
-                    # Legacy y0-only fields remain available.
                     "coarse_best_y0_mm": yr["coarse_best"],
-                    "coarse_best_zncc": yr["coarse_score"],
+                    "coarse_best_y0_mtre_mm": yr["coarse_mtre_mm"],
                     "best_y0_mm": float(new_y0),
-                    "best_zncc": float(score),
+                    "y0_best_mtre_mm": yr["mtre_mm"],
+                    "round_mtre_mm": float(round_mtre),
                     "delta_y0_mm": abs(float(dy)),
                     "delta_origin_mm": float(delta),
-                    "boundary_hit": yr["boundary_hit"],
-                    "coarse_scores": yr["coarse_scores"],
-                    "fine_scores": yr["fine_scores"],
+                    "y0_boundary_hit": yr["boundary_hit"],
+                    "y0_coarse_scores": yr["coarse_scores"],
+                    "y0_fine_scores": yr["fine_scores"],
                 }
             )
 
             if self.verbose > 0:
                 if x_result is not None:
                     print(
-                        f"[Auto origin] x0 -> {new_x0:+.3f} mm "
-                        f"(ZNCC={x_result['score']:.6f})"
+                        f"[Auto origin mTRE] x0 -> {new_x0:+.3f} mm "
+                        f"(mTRE={x_result['mtre_mm']:.6f} mm)"
                     )
                 if y_result is not None:
                     print(
-                        f"[Auto origin] y0 -> {new_y0:+.3f} mm "
-                        f"(ZNCC={y_result['score']:.6f})"
+                        f"[Auto origin mTRE] y0 -> {new_y0:+.3f} mm "
+                        f"(mTRE={y_result['mtre_mm']:.6f} mm)"
                     )
                 print(
-                    f"[Auto origin] delta: dx0={abs(dx):.3f}, "
+                    f"[Auto origin mTRE] delta: dx0={abs(dx):.3f}, "
                     f"dy0={abs(dy):.3f}, norm={delta:.3f} mm"
                 )
 
@@ -438,12 +626,11 @@ class RegistrarModel(_RegistrarBase):
                 converged = True
                 if self.verbose > 0:
                     print(
-                        f"[Auto origin] Converged: origin delta <= "
+                        f"[Auto origin mTRE] Converged: origin delta <= "
                         f"{self.y0_convergence_tol:.3f} mm"
                     )
                 break
 
-        # Restore the historical-best pose/origin tuple exactly as scored.
         x0, y0 = best["x0"], best["y0"]
         pose, resampled_gt = best["pose"], best["resampled_gt"]
         metadata.update(
@@ -457,15 +644,16 @@ class RegistrarModel(_RegistrarBase):
                 "selected_round": best["round"],
                 "selected_pose_input_x0_mm": best["input_x0"],
                 "selected_pose_input_y0_mm": best["input_y0"],
-                "best_zncc": best["score"],
+                "best_mtre_mm": best["mtre_mm"],
                 "last_round_x0_mm": current_x0,
                 "last_round_y0_mm": current_y0,
             }
         )
         if self.verbose > 0:
             print(
-                f"\n[Auto origin] Historical best: round={best['round']}, "
-                f"x0={x0:+.3f}, y0={y0:+.3f} mm, ZNCC={best['score']:.6f}"
+                f"\n[Auto origin mTRE] Historical best: round={best['round']}, "
+                f"x0={x0:+.3f}, y0={y0:+.3f} mm, "
+                f"mTRE={best['mtre_mm']:.6f} mm"
             )
 
         result = (gt, sdd, delx, dely, x0, y0, pf_to_af, pose)
