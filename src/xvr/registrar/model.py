@@ -1,4 +1,7 @@
+import math
+
 import torch
+from diffdrr.pose import RigidTransform
 from pydicom import dcmread
 
 from ..io import read_xray
@@ -6,7 +9,6 @@ from ..model.inference import _construct_antipode, _correct_pose, predict_pose
 from ..model.network import load_model
 from ..utils import XrayTransforms
 from .base import _RegistrarBase
-from diffdrr.pose import RigidTransform
 
 
 class RegistrarModel(_RegistrarBase):
@@ -50,28 +52,36 @@ class RegistrarModel(_RegistrarBase):
         y0_search_scale=6.0,
         y0_max_rounds=10,
         y0_convergence_tol=0.5,
+        estimate_missing_x0=True,
+        x0_search_min=-50.0,
+        x0_search_max=50.0,
+        x0_coarse_step=2.0,
+        x0_fine_radius=3.0,
+        x0_fine_step=0.25,
     ):
-        # Initialize the model and its config
         self.ckptpath = ckptpath
         self.model, self.config, self.date = load_model(self.ckptpath, meta=True)
-
-        # Initial pose correction
         self.warp = warp
         self.invert = invert
         self.antipodal = antipodal
 
-        # Missing principal-point estimation
+        self.estimate_missing_x0 = estimate_missing_x0
         self.estimate_missing_y0 = estimate_missing_y0
+        self.x0_search_min = float(x0_search_min)
+        self.x0_search_max = float(x0_search_max)
+        self.x0_coarse_step = float(x0_coarse_step)
+        self.x0_fine_radius = float(x0_fine_radius)
+        self.x0_fine_step = float(x0_fine_step)
         self.y0_search_min = float(y0_search_min)
         self.y0_search_max = float(y0_search_max)
         self.y0_coarse_step = float(y0_coarse_step)
         self.y0_fine_radius = float(y0_fine_radius)
         self.y0_fine_step = float(y0_fine_step)
+        # Backward-compatible names: these now control the joint origin search.
         self.y0_search_scale = float(y0_search_scale)
         self.y0_max_rounds = int(y0_max_rounds)
         self.y0_convergence_tol = float(y0_convergence_tol)
-
-        self._validate_y0_search_config()
+        self._validate_origin_search_config()
 
         super().__init__(
             volume,
@@ -106,33 +116,55 @@ class RegistrarModel(_RegistrarBase):
                 "date": self.date,
                 "warp": self.warp,
                 "invert": self.invert,
-            "y0_estimation": {
-                "enabled": self.estimate_missing_y0,
-                "performed": False,
-                "reason": None,
-
-                "search_min_mm": self.y0_search_min,
-                "search_max_mm": self.y0_search_max,
-                "coarse_step_mm": self.y0_coarse_step,
-                "fine_radius_mm": self.y0_fine_radius,
-                "fine_step_mm": self.y0_fine_step,
-                "search_scale": self.y0_search_scale,
-
-                "max_rounds": self.y0_max_rounds,
-                "convergence_tol_mm": self.y0_convergence_tol,
-            },
+                # Keep the historical key to avoid breaking result readers.
+                "y0_estimation": {
+                    "enabled": self.estimate_missing_x0 or self.estimate_missing_y0,
+                    "mode": "alternating_coordinate_x0_y0",
+                    "performed": False,
+                    "reason": None,
+                    "x0_enabled": self.estimate_missing_x0,
+                    "y0_enabled": self.estimate_missing_y0,
+                    "x0_search_min_mm": self.x0_search_min,
+                    "x0_search_max_mm": self.x0_search_max,
+                    "x0_coarse_step_mm": self.x0_coarse_step,
+                    "x0_fine_radius_mm": self.x0_fine_radius,
+                    "x0_fine_step_mm": self.x0_fine_step,
+                    "search_min_mm": self.y0_search_min,
+                    "search_max_mm": self.y0_search_max,
+                    "coarse_step_mm": self.y0_coarse_step,
+                    "fine_radius_mm": self.y0_fine_radius,
+                    "fine_step_mm": self.y0_fine_step,
+                    "search_scale": self.y0_search_scale,
+                    "max_rounds": self.y0_max_rounds,
+                    "convergence_tol_mm": self.y0_convergence_tol,
+                },
             },
         )
 
-    def _validate_y0_search_config(self):
-        if self.y0_search_min >= self.y0_search_max:
-            raise ValueError("y0_search_min must be smaller than y0_search_max")
-        if self.y0_coarse_step <= 0:
-            raise ValueError("y0_coarse_step must be positive")
-        if self.y0_fine_radius <= 0:
-            raise ValueError("y0_fine_radius must be positive")
-        if self.y0_fine_step <= 0:
-            raise ValueError("y0_fine_step must be positive")
+    @staticmethod
+    def _validate_axis(name, lo, hi, coarse, radius, fine):
+        if lo >= hi:
+            raise ValueError(f"{name}_search_min must be smaller than {name}_search_max")
+        if coarse <= 0 or radius <= 0 or fine <= 0:
+            raise ValueError(f"{name} search steps/radius must be positive")
+
+    def _validate_origin_search_config(self):
+        self._validate_axis(
+            "x0",
+            self.x0_search_min,
+            self.x0_search_max,
+            self.x0_coarse_step,
+            self.x0_fine_radius,
+            self.x0_fine_step,
+        )
+        self._validate_axis(
+            "y0",
+            self.y0_search_min,
+            self.y0_search_max,
+            self.y0_coarse_step,
+            self.y0_fine_radius,
+            self.y0_fine_step,
+        )
         if self.y0_search_scale <= 0:
             raise ValueError("y0_search_scale must be positive")
         if self.y0_max_rounds <= 0:
@@ -143,160 +175,104 @@ class RegistrarModel(_RegistrarBase):
     @staticmethod
     def _detector_active_origin_present(filename):
         ds = dcmread(filename, stop_before_pixels=True)
-        return getattr(ds, "DetectorActiveOrigin", None) is not None
+        origin = getattr(ds, "DetectorActiveOrigin", None)
+        try:
+            return origin is not None and len(origin) == 2 and all(v is not None for v in origin)
+        except TypeError:
+            return False
 
     @staticmethod
     def _zncc(a, b, eps=1e-8):
-        a = a.flatten().double()
-        b = b.flatten().double()
-        a = a - a.mean()
-        b = b - b.mean()
-        denominator = torch.sqrt((a * a).sum() * (b * b).sum())
-        return ((a * b).sum() / (denominator + eps)).item()
+        a = a.flatten().double() - a.double().mean()
+        b = b.flatten().double() - b.double().mean()
+        denom = torch.sqrt((a * a).sum() * (b * b).sum())
+        return ((a * b).sum() / (denom + eps)).item()
 
     @staticmethod
-    def _scan_values(start, stop, step):
+    def _scan_values(start, stop, step, include=None):
         n = int(round((stop - start) / step))
-        return [start + idx * step for idx in range(n + 1)]
+        values = [start + i * step for i in range(n + 1)]
+        if include is not None and start <= include <= stop:
+            include = float(include)
+            if all(abs(x - include) > 1e-9 for x in values):
+                values.append(include)
+                values.sort()
+        return values
 
-    def _score_y0_candidates(self, gt, init_pose, sdd, delx, dely, x0, candidates):
+    def _score_axis(self, gt, pose, sdd, delx, dely, x0, y0, axis, candidates):
+        """Score candidates in DICOM/XVR x0,y0 convention with pose fixed."""
         *_, height, width = gt.shape
 
-        # Search at a reduced detector resolution to avoid full-resolution DRR rendering.
-        self.drr.set_intrinsics_(
-            sdd=sdd,
-            height=height,
-            width=width,
-            delx=delx,
-            dely=dely,
-            x0=-x0,
-            y0=float(candidates[0]),
-        )
-        self.drr.rescale_detector_(1.0 / self.y0_search_scale)
+        def set_intrinsics(candidate):
+            candidate_x0 = float(candidate) if axis == "x0" else float(x0)
+            candidate_y0 = float(candidate) if axis == "y0" else float(y0)
+            self.drr.set_intrinsics_(
+                sdd=sdd,
+                height=height,
+                width=width,
+                delx=delx,
+                dely=dely,
+                # CRITICAL SIGN CONVENTION:
+                # read_xray/predict_pose use DICOM x0; DiffDRR uses -x0.
+                x0=-candidate_x0,
+                y0=candidate_y0,
+            )
+            self.drr.rescale_detector_(1.0 / self.y0_search_scale)
+
+        set_intrinsics(candidates[0])
         transform = XrayTransforms(self.drr.detector.height, self.drr.detector.width)
         gt_search = transform(gt).cuda()
-
         scores = []
         with torch.no_grad():
             for candidate in candidates:
-                self.drr.set_intrinsics_(
-                    sdd=sdd,
-                    height=height,
-                    width=width,
-                    delx=delx,
-                    dely=dely,
-                    x0=-x0,
-                    y0=float(candidate),
-                )
-                self.drr.rescale_detector_(1.0 / self.y0_search_scale)
-                pred = transform(self.drr(init_pose))
-                score = self._zncc(gt_search, pred)
+                set_intrinsics(candidate)
+                score = self._zncc(gt_search, transform(self.drr(pose)))
                 scores.append((float(candidate), float(score)))
-
                 if self.verbose > 1:
-                    print(f"  y0={candidate:+7.2f} mm | ZNCC={score:.6f}")
-
+                    print(f"  {axis}={candidate:+7.2f} mm | ZNCC={score:.6f}")
         return scores
-    def _search_best_y0(
-        self,
-        gt,
-        pose,
-        sdd,
-        delx,
-        dely,
-        x0,
-    ):
-        """
-        Search y0 while keeping the supplied pose fixed.
 
-        Each call performs a completely new:
-            global coarse search
-                ->
-            local fine search
+    def _search_axis(self, gt, pose, sdd, delx, dely, x0, y0, axis):
+        if axis == "x0":
+            lo, hi = self.x0_search_min, self.x0_search_max
+            coarse, radius, fine = (
+                self.x0_coarse_step,
+                self.x0_fine_radius,
+                self.x0_fine_step,
+            )
+            current = x0
+        elif axis == "y0":
+            lo, hi = self.y0_search_min, self.y0_search_max
+            coarse, radius, fine = (
+                self.y0_coarse_step,
+                self.y0_fine_radius,
+                self.y0_fine_step,
+            )
+            current = y0
+        else:
+            raise ValueError(f"Unknown principal-point axis: {axis}")
 
-        Therefore, whenever the network predicts a new pose,
-        y0 is searched globally again.
-        """
-
-        # --------------------------------------------------------
-        # Global coarse search
-        # --------------------------------------------------------
-
-        coarse_candidates = self._scan_values(
-            self.y0_search_min,
-            self.y0_search_max,
-            self.y0_coarse_step,
+        coarse_values = self._scan_values(lo, hi, coarse, include=current)
+        coarse_scores = self._score_axis(
+            gt, pose, sdd, delx, dely, x0, y0, axis, coarse_values
         )
-
-        coarse_scores = self._score_y0_candidates(
-            gt,
-            pose,
-            sdd,
-            delx,
-            dely,
-            x0,
-            coarse_candidates,
+        coarse_best, coarse_score = max(coarse_scores, key=lambda z: z[1])
+        fine_lo = max(lo, coarse_best - radius)
+        fine_hi = min(hi, coarse_best + radius)
+        fine_values = self._scan_values(fine_lo, fine_hi, fine, include=coarse_best)
+        fine_scores = self._score_axis(
+            gt, pose, sdd, delx, dely, x0, y0, axis, fine_values
         )
-
-        coarse_best_y0, coarse_best_score = max(
-            coarse_scores,
-            key=lambda item: item[1],
-        )
-
-        # --------------------------------------------------------
-        # Local fine search around NEW coarse optimum
-        # --------------------------------------------------------
-
-        fine_start = max(
-            self.y0_search_min,
-            coarse_best_y0 - self.y0_fine_radius,
-        )
-
-        fine_stop = min(
-            self.y0_search_max,
-            coarse_best_y0 + self.y0_fine_radius,
-        )
-
-        fine_candidates = self._scan_values(
-            fine_start,
-            fine_stop,
-            self.y0_fine_step,
-        )
-
-        fine_scores = self._score_y0_candidates(
-            gt,
-            pose,
-            sdd,
-            delx,
-            dely,
-            x0,
-            fine_candidates,
-        )
-
-        best_y0, best_score = max(
-            fine_scores,
-            key=lambda item: item[1],
-        )
-
-        boundary_hit = (
-            abs(best_y0 - fine_start)
-            <= self.y0_fine_step / 2
-            or
-            abs(best_y0 - fine_stop)
-            <= self.y0_fine_step / 2
-        )
-
+        best, score = max(fine_scores, key=lambda z: z[1])
         return {
-            "best_y0_mm": float(best_y0),
-            "best_zncc": float(best_score),
-
-            "coarse_best_y0_mm": float(coarse_best_y0),
-            "coarse_best_zncc": float(coarse_best_score),
-
+            "best": float(best),
+            "score": float(score),
+            "coarse_best": float(coarse_best),
+            "coarse_score": float(coarse_score),
             "coarse_scores": coarse_scores,
             "fine_scores": fine_scores,
-
-            "boundary_hit": boundary_hit,
+            "boundary_hit": abs(best - fine_lo) <= fine / 2
+            or abs(best - fine_hi) <= fine / 2,
         }
 
     def _correct_initial_pose(self, pose):
@@ -306,11 +282,6 @@ class RegistrarModel(_RegistrarBase):
         return pose
 
     def initialize_pose(self, i2d, return_resampled=False):
-
-        # ========================================================
-        # 1. Read X-ray and DICOM intrinsics
-        # ========================================================
-
         gt, sdd, delx, dely, x0, y0, pf_to_af = read_xray(
             i2d,
             self.crop,
@@ -318,306 +289,184 @@ class RegistrarModel(_RegistrarBase):
             self.linearize,
             self.reducefn,
         )
-
-        detector_origin_present = (
-            self._detector_active_origin_present(i2d)
-        )
-
+        origin_present = self._detector_active_origin_present(i2d)
         metadata = self.save_kwargs["y0_estimation"]
-
-        metadata["detector_active_origin_present"] = (
-            detector_origin_present
+        metadata.update(
+            {
+                "detector_active_origin_present": origin_present,
+                "dicom_x0_mm": float(x0),
+                "dicom_y0_mm": float(y0),
+            }
         )
 
-        metadata["dicom_y0_mm"] = float(y0)
-
-
-        # ========================================================
-        # 2. Normal path:
-        #    DICOM already contains DetectorActiveOrigin
-        # ========================================================
-
-        if detector_origin_present or not self.estimate_missing_y0:
-
-            init_pose, resampled_gt = predict_pose(
-                self.model,
-                self.config,
-                gt,
-                sdd,
-                delx,
-                dely,
-                x0,
-                y0,
+        auto_enabled = self.estimate_missing_x0 or self.estimate_missing_y0
+        if origin_present or not auto_enabled:
+            pose, resampled_gt = predict_pose(
+                self.model, self.config, gt, sdd, delx, dely, x0, y0
             )
-
-            init_pose = self._correct_initial_pose(init_pose)
-
-            if detector_origin_present:
-                metadata["reason"] = (
-                    "DetectorActiveOrigin present in DICOM"
-                )
-            else:
-                metadata["reason"] = (
-                    "automatic y0 estimation disabled"
-                )
-
-            if return_resampled:
-                return (
-                    gt,
-                    sdd,
-                    delx,
-                    dely,
-                    x0,
-                    y0,
-                    pf_to_af,
-                    init_pose,
-                    resampled_gt,
-                )
-
-            return (
-                gt,
-                sdd,
-                delx,
-                dely,
-                x0,
-                y0,
-                pf_to_af,
-                init_pose,
+            pose = self._correct_initial_pose(pose)
+            metadata["reason"] = (
+                "DetectorActiveOrigin present in DICOM"
+                if origin_present
+                else "automatic principal-point estimation disabled"
             )
-
-
-        # ========================================================
-        # 3. DetectorActiveOrigin missing:
-        #    alternating network pose / global y0 search
-        # ========================================================
+            result = (gt, sdd, delx, dely, x0, y0, pf_to_af, pose)
+            return (*result, resampled_gt) if return_resampled else result
 
         metadata["performed"] = True
         metadata["reason"] = "DetectorActiveOrigin missing"
-
+        current_x0, current_y0 = float(x0), float(y0)
         rounds = []
-        best_global_score = float("-inf")
-        best_global_y0 = None
-        best_global_pose = None
-        best_global_resampled_gt = None
-        best_global_round = None
-        best_global_input_y0 = None
-
-        current_y0 = float(y0)  # normally 0.0
-
+        best = None
         converged = False
 
-
         for round_idx in range(self.y0_max_rounds):
-
-            # ----------------------------------------------------
-            # A. Predict pose using CURRENT y0
-            # ----------------------------------------------------
-
-            init_pose, resampled_gt = predict_pose(
+            input_x0, input_y0 = current_x0, current_y0
+            pose, resampled_gt = predict_pose(
                 self.model,
                 self.config,
                 gt,
                 sdd,
                 delx,
                 dely,
-                x0,
-                current_y0,
+                input_x0,
+                input_y0,
             )
-
-            init_pose = self._correct_initial_pose(init_pose)
-
+            pose = self._correct_initial_pose(pose)
 
             if self.verbose > 0:
-                print()
                 print(
-                    f"[Auto y0] Round "
-                    f"{round_idx + 1}/{self.y0_max_rounds}"
-                )
-                print(
-                    f"[Auto y0] Network input y0 = "
-                    f"{current_y0:+.3f} mm"
+                    f"\n[Auto origin] Round {round_idx + 1}/{self.y0_max_rounds}: "
+                    f"network input x0={input_x0:+.3f}, y0={input_y0:+.3f} mm"
                 )
 
-
-            # ----------------------------------------------------
-            # B. FIX this pose and perform a NEW global y0 search
-            # ----------------------------------------------------
-
-            result = self._search_best_y0(
-                gt,
-                init_pose,
-                sdd,
-                delx,
-                dely,
-                x0,
-            )
-
-            new_y0 = result["best_y0_mm"]
-
-            delta_y0 = abs(new_y0 - current_y0)
-            if result["best_zncc"] > best_global_score:
-                best_global_score = float(result["best_zncc"])
-                best_global_y0 = float(result["best_y0_mm"])
-                best_global_pose = RigidTransform(
-                    init_pose.matrix.detach().clone()
+            # Alternating coordinate search with one fixed network pose:
+            # x0 first (y0 fixed), then y0 (new x0 fixed).
+            x_result = None
+            new_x0 = input_x0
+            if self.estimate_missing_x0:
+                x_result = self._search_axis(
+                    gt, pose, sdd, delx, dely, input_x0, input_y0, "x0"
                 )
-                best_global_resampled_gt = resampled_gt.detach().clone()
-                best_global_round = round_idx + 1
-                best_global_input_y0 = float(current_y0)
-            if self.verbose > 0:
-                print(
-                    f"[Auto y0] Coarse best = "
-                    f"{result['coarse_best_y0_mm']:+.3f} mm "
-                    f"(ZNCC={result['coarse_best_zncc']:.6f})"
+                new_x0 = x_result["best"]
+
+            y_result = None
+            new_y0 = input_y0
+            if self.estimate_missing_y0:
+                y_result = self._search_axis(
+                    gt, pose, sdd, delx, dely, new_x0, input_y0, "y0"
                 )
+                new_y0 = y_result["best"]
 
-                print(
-                    f"[Auto y0] Fine best   = "
-                    f"{new_y0:+.3f} mm "
-                    f"(ZNCC={result['best_zncc']:.6f})"
-                )
+            final_result = y_result if y_result is not None else x_result
+            if final_result is None:
+                raise RuntimeError("No principal-point coordinate enabled for search")
+            score = final_result["score"]
+            dx, dy = new_x0 - input_x0, new_y0 - input_y0
+            delta = math.hypot(dx, dy)
 
-                print(
-                    f"[Auto y0] Delta       = "
-                    f"{delta_y0:.3f} mm"
-                )
+            if best is None or score > best["score"]:
+                best = {
+                    "score": float(score),
+                    "x0": float(new_x0),
+                    "y0": float(new_y0),
+                    "pose": RigidTransform(pose.matrix.detach().clone()),
+                    "resampled_gt": resampled_gt.detach().clone(),
+                    "round": round_idx + 1,
+                    "input_x0": float(input_x0),
+                    "input_y0": float(input_y0),
+                }
 
+            def trace(result, fallback):
+                if result is None:
+                    return {
+                        "coarse_best": fallback,
+                        "coarse_score": None,
+                        "best": fallback,
+                        "score": None,
+                        "boundary_hit": False,
+                        "coarse_scores": [],
+                        "fine_scores": [],
+                    }
+                return result
 
-            # ----------------------------------------------------
-            # C. Save complete trace for this round
-            # ----------------------------------------------------
-
+            xr, yr = trace(x_result, input_x0), trace(y_result, input_y0)
             rounds.append(
                 {
                     "round": round_idx + 1,
-                    "input_y0_mm": float(current_y0),
-
-                    "coarse_best_y0_mm":
-                        result["coarse_best_y0_mm"],
-
-                    "coarse_best_zncc":
-                        result["coarse_best_zncc"],
-
-                    "best_y0_mm":
-                        result["best_y0_mm"],
-
-                    "best_zncc":
-                        result["best_zncc"],
-
-                    "delta_y0_mm":
-                        float(delta_y0),
-
-                    "boundary_hit":
-                        result["boundary_hit"],
-
-                    "coarse_scores":
-                        result["coarse_scores"],
-
-                    "fine_scores":
-                        result["fine_scores"],
+                    "input_x0_mm": float(input_x0),
+                    "input_y0_mm": float(input_y0),
+                    "coarse_best_x0_mm": xr["coarse_best"],
+                    "coarse_best_x0_zncc": xr["coarse_score"],
+                    "best_x0_mm": float(new_x0),
+                    "x0_best_zncc": xr["score"],
+                    "delta_x0_mm": abs(float(dx)),
+                    "x0_boundary_hit": xr["boundary_hit"],
+                    "x0_coarse_scores": xr["coarse_scores"],
+                    "x0_fine_scores": xr["fine_scores"],
+                    # Legacy y0-only fields remain available.
+                    "coarse_best_y0_mm": yr["coarse_best"],
+                    "coarse_best_zncc": yr["coarse_score"],
+                    "best_y0_mm": float(new_y0),
+                    "best_zncc": float(score),
+                    "delta_y0_mm": abs(float(dy)),
+                    "delta_origin_mm": float(delta),
+                    "boundary_hit": yr["boundary_hit"],
+                    "coarse_scores": yr["coarse_scores"],
+                    "fine_scores": yr["fine_scores"],
                 }
             )
 
+            if self.verbose > 0:
+                if x_result is not None:
+                    print(
+                        f"[Auto origin] x0 -> {new_x0:+.3f} mm "
+                        f"(ZNCC={x_result['score']:.6f})"
+                    )
+                if y_result is not None:
+                    print(
+                        f"[Auto origin] y0 -> {new_y0:+.3f} mm "
+                        f"(ZNCC={y_result['score']:.6f})"
+                    )
+                print(
+                    f"[Auto origin] delta: dx0={abs(dx):.3f}, "
+                    f"dy0={abs(dy):.3f}, norm={delta:.3f} mm"
+                )
 
-            # ----------------------------------------------------
-            # D. Update y0
-            # ----------------------------------------------------
-
-            current_y0 = float(new_y0)
-
-
-            # ----------------------------------------------------
-            # E. Convergence check
-            # ----------------------------------------------------
-
-            if delta_y0 <= self.y0_convergence_tol:
-
+            current_x0, current_y0 = float(new_x0), float(new_y0)
+            if delta <= self.y0_convergence_tol:
                 converged = True
-
                 if self.verbose > 0:
                     print(
-                        f"[Auto y0] Converged: "
-                        f"|delta y0| <= "
+                        f"[Auto origin] Converged: origin delta <= "
                         f"{self.y0_convergence_tol:.3f} mm"
                     )
-
                 break
 
-
-        # ========================================================
-        # 4. Restore the HISTORICAL-BEST (pose, y0) pair.
-        #
-        #    Do NOT run the network again with best_global_y0 here.
-        #    The selected score was measured with the pose saved
-        #    from best_global_round and the swept best_global_y0.
-        #    Re-predicting the pose would create a different state
-        #    and could destroy the historical-best ZNCC.
-        # ========================================================
-
-        y0 = float(best_global_y0)
-        init_pose = best_global_pose
-        resampled_gt = best_global_resampled_gt
-
-        # ========================================================
-        # 5. Save final metadata
-        # ========================================================
-
+        # Restore the historical-best pose/origin tuple exactly as scored.
+        x0, y0 = best["x0"], best["y0"]
+        pose, resampled_gt = best["pose"], best["resampled_gt"]
         metadata.update(
             {
                 "rounds": rounds,
                 "n_rounds": len(rounds),
                 "converged": converged,
-
+                "estimated_x0_mm": x0,
                 "estimated_y0_mm": y0,
-
-                "selected_round": best_global_round,
-                "selected_pose_input_y0_mm": best_global_input_y0,
-                "best_zncc": best_global_score,
-
-                "last_round_y0_mm": float(current_y0),
+                "estimated_origin_mm": [x0, y0],
+                "selected_round": best["round"],
+                "selected_pose_input_x0_mm": best["input_x0"],
+                "selected_pose_input_y0_mm": best["input_y0"],
+                "best_zncc": best["score"],
+                "last_round_x0_mm": current_x0,
+                "last_round_y0_mm": current_y0,
             }
         )
-
-
         if self.verbose > 0:
-            print()
             print(
-                f"[Auto y0] Selected historical best: "
-                f"round={best_global_round}, "
-                f"y0={y0:+.3f} mm, "
-                f"ZNCC={best_global_score:.6f}"
+                f"\n[Auto origin] Historical best: round={best['round']}, "
+                f"x0={x0:+.3f}, y0={y0:+.3f} mm, ZNCC={best['score']:.6f}"
             )
 
-            print(
-                f"[Auto y0] rounds = {len(rounds)}, "
-                f"converged = {converged}"
-            )
-
-
-        # ========================================================
-        # 6. Return FINAL y0 and FINAL network pose
-        # ========================================================
-
-        if return_resampled:
-            return (
-                gt,
-                sdd,
-                delx,
-                dely,
-                x0,
-                y0,
-                pf_to_af,
-                init_pose,
-                resampled_gt,
-            )
-
-        return (
-            gt,
-            sdd,
-            delx,
-            dely,
-            x0,
-            y0,
-            pf_to_af,
-            init_pose,
-        )
+        result = (gt, sdd, delx, dely, x0, y0, pf_to_af, pose)
+        return (*result, resampled_gt) if return_resampled else result
