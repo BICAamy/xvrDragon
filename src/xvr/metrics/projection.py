@@ -13,42 +13,38 @@ def projection_to_image_pixels(
     reverse_x_axis: bool = False,
 ) -> torch.Tensor:
     """
-    Convert ``DRR.perspective_projection`` output to raster-image pixels.
+    Convert ``DRR.perspective_projection`` output to the AP raster convention
+    used by the vertebra datasets.
 
-    This adapter is for comparing DiffDRR projected 3D fiducials against
-    real 2D image annotations stored in raster/DICOM pixel coordinates.
+    Important: the external raster convention and DiffDRR's detector convention
+    are two different things.
 
-    For AP, DiffDRR's own ``perspective_projection`` applies a horizontal
-    ``width - u`` transform when ``detector.reverse_x_axis=True``. Therefore
-    the raster conversion depends on the detector convention::
+    ``test_corrected`` is paired with ``reverse_x_axis=False`` and
+    ``test_reverse`` is its horizontal mirror paired with
+    ``reverse_x_axis=True``. DiffDRR itself already changes the returned
+    perspective-projection x coordinate when reverse-x is enabled. Because the
+    corresponding real X-ray/landmark dataset is mirrored at the same time, the
+    final projection-to-raster adapter is the SAME in both paired pipelines::
 
-        reverse_x_axis=False: u_image = width - u_diffdrr
-        reverse_x_axis=True:  u_image = u_diffdrr
-        both conventions:     v_image = v_diffdrr
+        u_image = width - u_diffdrr
+        v_image = v_diffdrr
 
-    The two formulas are deliberately complementary. With reverse-x enabled,
-    DiffDRR has already performed the horizontal conversion before returning
-    the projected points, so applying another ``width - u`` here would double
-    flip them.
+    For the same physical pose (ignoring the one-pixel discrete/continuous
+    distinction), DiffDRR gives approximately::
 
-    Important
-    ---------
-    ``width - u`` is intentional for the non-reversed convention. DiffDRR's
-    projected points use a continuous detector coordinate convention. This is
-    different from horizontally mirroring a zero-based raster annotation,
-    where the correct transform is ``width - 1 - u``.
+        u_proj(reverse=True) = width - u_proj(reverse=False)
 
-    Parameters
-    ----------
-    points:
-        Tensor with final dimension ``[..., 2]`` returned by
-        ``DRR.perspective_projection``.
-    width:
-        Detector/image width in pixels.
-    orientation:
-        X-ray orientation. Only ``"AP"`` is supported here.
-    reverse_x_axis:
-        The ``DRR.detector.reverse_x_axis`` setting that produced ``points``.
+    Therefore applying ``width - u`` to both modes produces two predictions
+    that are horizontal mirrors of each other, exactly matching the relationship
+    between ``test_corrected`` and ``test_reverse``.
+
+    ``reverse_x_axis`` is still required so callers explicitly state which DRR
+    convention produced ``points``; ``project_fiducials_to_image_pixels`` checks
+    that it matches ``drr.detector.reverse_x_axis``.
+
+    Note that this continuous projection conversion uses ``width - u``. A true
+    zero-based raster-image flip uses ``width - 1 - u``; those operations must
+    not be mixed.
     """
     if points.shape[-1] != 2:
         raise ValueError(
@@ -66,9 +62,12 @@ def projection_to_image_pixels(
             f"Got orientation={orientation!r}."
         )
 
+    # The vertebra AP raster adapter is deliberately identical for the two
+    # paired dataset/detector conventions. DiffDRR has already encoded the
+    # reverse-x choice in `points`; the external test_reverse dataset is also
+    # horizontally mirrored relative to test_corrected.
     image_points = points.clone()
-    if not reverse_x_axis:
-        image_points[..., 0] = float(width) - image_points[..., 0]
+    image_points[..., 0] = float(width) - image_points[..., 0]
     return image_points
 
 
@@ -80,13 +79,7 @@ def project_fiducials_to_image_pixels(
     orientation: str = "AP",
     reverse_x_axis: bool = False,
 ) -> torch.Tensor:
-    """
-    Project 3D fiducials and return coordinates in raster-image pixel space.
-
-    Use this helper for real-image 2D landmark error instead of comparing
-    ``DRR.perspective_projection`` output directly with DICOM/raster
-    annotations.
-    """
+    """Project 3D fiducials and return AP raster-image pixel coordinates."""
     detector_reverse = bool(drr.detector.reverse_x_axis)
     requested_reverse = bool(reverse_x_axis)
     if detector_reverse != requested_reverse:
