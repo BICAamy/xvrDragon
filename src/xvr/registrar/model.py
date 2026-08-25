@@ -48,7 +48,7 @@ class RegistrarModel(_RegistrarBase):
         y0_fine_radius=3.0,
         y0_fine_step=0.25,
         y0_search_scale=6.0,
-        y0_max_rounds=6,
+        y0_max_rounds=10,
         y0_convergence_tol=0.5,
     ):
         # Initialize the model and its config

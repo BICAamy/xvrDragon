@@ -45,6 +45,12 @@ def _parse_dicom(filename):
     # Get the image
     ds = dcmread(filename)
     img = ds.pixel_array.astype(np.int32)
+    photometric = str(
+        getattr(ds, "PhotometricInterpretation", "")
+    ).upper()
+
+    if photometric == "MONOCHROME1":
+        img = img.max() + img.min() - img
     img = torch.from_numpy(img).to(torch.float32)[None, None]
 
     # Get intrinsic parameters of the imaging system
@@ -56,10 +62,11 @@ def _parse_dicom(filename):
             dely, delx = ds.ImagerPixelSpacing
         except AttributeError:
             raise AttributeError("Cannot find pixel spacing in DICOM file")
-    try:
-        y0, x0 = ds.DetectorActiveOrigin
-    except AttributeError:
+    origin = getattr(ds, "DetectorActiveOrigin", None)
+    if origin is None or len(origin) != 2:
         y0, x0 = 0.0, 0.0
+    else:
+        y0, x0 = float(origin[0]), float(origin[1])
 
     # Reorient RAO images from posterior-foot (PF) to anterior-foot (AF)
     # https://dicom.innolitics.com/ciods/x-ray-angiographic-image/general-image/00200020
