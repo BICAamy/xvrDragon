@@ -3,6 +3,7 @@
 
 Reports final-pose landmark mTRE together with image-similarity metrics on the
 same last multiscale detector grid used by XVR: ZNCC, MNCC, GNCC and Combined.
+Supports both AP detector conventions, including ``reverse_x_axis=True``.
 """
 
 from __future__ import annotations
@@ -229,7 +230,6 @@ def compute_final_similarity(
     if not scales:
         raise ValueError("No registration scales found in parameters.pt")
 
-    # Reproduce the exact sequential detector resizing used during registration.
     for scale in scales:
         drr.rescale_detector_(scale)
 
@@ -355,12 +355,6 @@ def main() -> None:
         raise NotImplementedError(
             f"This validator is currently validated only for AP; got orientation={orientation!r}."
         )
-    if bool(cfg["reverse_x_axis"]):
-        raise ValueError(
-            "The current AP projection-to-raster adapter is validated only for "
-            "reverse_x_axis=False. reverse_x_axis=True mTRE validation needs its "
-            "own verified projection convention before this guard can be removed."
-        )
     if int(params.get("xray", {}).get("crop", 0)) != 0:
         raise ValueError(
             "This validator requires crop=0 because landmarks.json stores full-raster coordinates."
@@ -368,11 +362,12 @@ def main() -> None:
     if bool(params.get("pf_to_af", False)):
         raise ValueError(
             "The registration applied a PF->AF horizontal flip; this AP validator refuses "
-            "to silently mix that raster convention."
+            "to silently mix that convention."
         )
     if params.get("final_pose") is None:
         raise RuntimeError("final_pose is None; no final registration pose is available.")
 
+    reverse_x_axis = bool(cfg["reverse_x_axis"])
     rows = load_landmarks(landmarks_path)
     lps = np.asarray([r["lps"] for r in rows], dtype=np.float32)
     gt = np.asarray([r["gt"] for r in rows], dtype=np.float32)
@@ -425,7 +420,7 @@ def main() -> None:
         float(cfg["dely"]),
         float(cfg["x0"]),
         float(cfg["y0"]),
-        reverse_x_axis=False,
+        reverse_x_axis=reverse_x_axis,
         renderer=cfg["renderer"],
         **cfg.get("drr_kwargs", {}),
     ).to(device)
@@ -433,7 +428,6 @@ def main() -> None:
     pose = RigidTransform(params["final_pose"].float().to(device))
     fiducials = subject.fiducials.to(device)
 
-    # A. Geometric validation at the original detector grid.
     with torch.no_grad():
         pred = (
             project_fiducials_to_image_pixels(
@@ -441,7 +435,7 @@ def main() -> None:
                 pose,
                 fiducials,
                 orientation="AP",
-                reverse_x_axis=False,
+                reverse_x_axis=reverse_x_axis,
             )[0]
             .cpu()
             .numpy()
@@ -469,7 +463,6 @@ def main() -> None:
             }
         )
 
-    # B. Image similarity on the exact last multiscale detector grid.
     similarity = compute_final_similarity(
         drr,
         pose,
@@ -483,6 +476,7 @@ def main() -> None:
     summary = {
         "case": case_id,
         "view": "AP",
+        "reverse_x_axis": reverse_x_axis,
         "registration_dir": str(args.registration_dir),
         "result_dir": str(result_dir),
         "parameters": str(params_path),
@@ -504,6 +498,7 @@ def main() -> None:
     print("SECOND-LAYER FINAL 2D PROJECTED mTRE")
     print("=" * 80)
     print(f"case          = {case_id}")
+    print(f"reverse_x_axis= {reverse_x_axis}")
     print(f"N             = {len(rows)}")
     print(f"mTRE          = {summary['mtre_px']:.3f} px")
     print(f"mTRE          = {summary['mtre_mm']:.3f} mm")
