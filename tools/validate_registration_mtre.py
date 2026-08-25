@@ -4,6 +4,13 @@
 Reports final-pose landmark mTRE together with image-similarity metrics on the
 same last multiscale detector grid used by XVR: ZNCC, MNCC, GNCC and Combined.
 Supports both AP detector conventions, including ``reverse_x_axis=True``.
+
+example:
+
+python tools/validate_registration_mtre.py \
+  --registration-dir outputs/vertebra/case01_ap_registration_auto_xy0 \
+  --case case01
+
 """
 
 from __future__ import annotations

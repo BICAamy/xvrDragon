@@ -9,6 +9,13 @@ for overlay/difference QC, the X-ray is resized to the saved DRR resolution.
 
 This is intentionally a visual QC step only; quantitative landmark error belongs
 to ``validate_registration_mtre.py``.
+
+example:
+
+python tools/validate_registration_image.py \
+  --registration-dir outputs/vertebra/case01_ap_registration_auto_xy0 \
+  --case case01
+
 """
 
 from __future__ import annotations
