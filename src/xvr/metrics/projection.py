@@ -18,18 +18,25 @@ def projection_to_image_pixels(
     This adapter is for comparing DiffDRR projected 3D fiducials against
     real 2D image annotations stored in raster/DICOM pixel coordinates.
 
-    The AP convention below has been validated for the vertebra pipeline
-    using canonical AP images and ``reverse_x_axis=False``::
+    For AP, DiffDRR's own ``perspective_projection`` applies a horizontal
+    ``width - u`` transform when ``detector.reverse_x_axis=True``. Therefore
+    the raster conversion depends on the detector convention::
 
-        u_image = width - u_diffdrr
-        v_image = v_diffdrr
+        reverse_x_axis=False: u_image = width - u_diffdrr
+        reverse_x_axis=True:  u_image = u_diffdrr
+        both conventions:     v_image = v_diffdrr
+
+    The two formulas are deliberately complementary. With reverse-x enabled,
+    DiffDRR has already performed the horizontal conversion before returning
+    the projected points, so applying another ``width - u`` here would double
+    flip them.
 
     Important
     ---------
-    ``width - u`` is intentional here. DiffDRR's projected points use a
-    continuous detector coordinate convention. This is different from
-    horizontally mirroring a zero-based raster annotation, where the
-    correct transform is ``width - 1 - u``.
+    ``width - u`` is intentional for the non-reversed convention. DiffDRR's
+    projected points use a continuous detector coordinate convention. This is
+    different from horizontally mirroring a zero-based raster annotation,
+    where the correct transform is ``width - 1 - u``.
 
     Parameters
     ----------
@@ -39,10 +46,9 @@ def projection_to_image_pixels(
     width:
         Detector/image width in pixels.
     orientation:
-        X-ray orientation. Only ``"AP"`` has been validated so far.
+        X-ray orientation. Only ``"AP"`` is supported here.
     reverse_x_axis:
-        DiffDRR detector setting used to produce the projection. The
-        canonical vertebra AP pipeline requires ``False``.
+        The ``DRR.detector.reverse_x_axis`` setting that produced ``points``.
     """
     if points.shape[-1] != 2:
         raise ValueError(
@@ -60,14 +66,9 @@ def projection_to_image_pixels(
             f"Got orientation={orientation!r}."
         )
 
-    if reverse_x_axis:
-        raise ValueError(
-            "The canonical vertebra AP adapter is defined for "
-            "reverse_x_axis=False. Do not silently mix detector conventions."
-        )
-
     image_points = points.clone()
-    image_points[..., 0] = float(width) - image_points[..., 0]
+    if not reverse_x_axis:
+        image_points[..., 0] = float(width) - image_points[..., 0]
     return image_points
 
 
@@ -86,10 +87,19 @@ def project_fiducials_to_image_pixels(
     ``DRR.perspective_projection`` output directly with DICOM/raster
     annotations.
     """
+    detector_reverse = bool(drr.detector.reverse_x_axis)
+    requested_reverse = bool(reverse_x_axis)
+    if detector_reverse != requested_reverse:
+        raise ValueError(
+            "Projection adapter convention does not match the DRR detector: "
+            f"detector.reverse_x_axis={detector_reverse}, "
+            f"adapter reverse_x_axis={requested_reverse}."
+        )
+
     projected = drr.perspective_projection(pose, fiducials)
     return projection_to_image_pixels(
         projected,
         drr.detector.width,
         orientation=orientation,
-        reverse_x_axis=reverse_x_axis,
+        reverse_x_axis=requested_reverse,
     )
