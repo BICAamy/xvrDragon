@@ -142,6 +142,7 @@ class RegistrarModel(_RegistrarBase):
                     "fine_step_mm": self.y0_fine_step,
                     "max_rounds": self.y0_max_rounds,
                     "convergence_tol_mm": self.y0_convergence_tol,
+                    "reverse_x_axis": bool(reverse_x_axis),
                 },
             },
         )
@@ -217,10 +218,6 @@ class RegistrarModel(_RegistrarBase):
             raise NotImplementedError(
                 "mTRE-based automatic principal-point estimation is currently "
                 f"validated only for AP, got {orientation!r}."
-            )
-        if self.reverse_x_axis:
-            raise ValueError(
-                "mTRE-based AP origin search requires the canonical reverse_x_axis=False convention."
             )
         if self.crop != 0:
             raise ValueError(
@@ -336,13 +333,14 @@ class RegistrarModel(_RegistrarBase):
                     # DICOM/XVR candidate x0 -> DiffDRR detector x0 = -candidate_x0.
                     x0=-candidate_x0,
                     y0=candidate_y0,
+                    reverse_x_axis=self.reverse_x_axis,
                 )
                 projected = project_fiducials_to_image_pixels(
                     self.drr,
                     pose,
                     fiducials,
                     orientation="AP",
-                    reverse_x_axis=False,
+                    reverse_x_axis=self.reverse_x_axis,
                 )
                 delta = projected - target_pixels
                 error_mm = torch.sqrt(
@@ -456,6 +454,7 @@ class RegistrarModel(_RegistrarBase):
                 "detector_active_origin_present": origin_present,
                 "dicom_x0_mm": float(x0),
                 "dicom_y0_mm": float(y0),
+                "reverse_x_axis": bool(self.reverse_x_axis),
             }
         )
 
@@ -507,7 +506,7 @@ class RegistrarModel(_RegistrarBase):
                 print(
                     f"\n[Auto origin mTRE] Round {round_idx + 1}/{self.y0_max_rounds}: "
                     f"network input x0={input_x0:+.3f}, y0={input_y0:+.3f} mm; "
-                    f"landmarks={targets['count']}"
+                    f"landmarks={targets['count']}; reverse_x_axis={self.reverse_x_axis}"
                 )
 
             x_result = None
